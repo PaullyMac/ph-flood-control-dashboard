@@ -11,8 +11,10 @@ Files
   - `data/Flood Control Projects Raw.csv`
   - `data/Flood Control Projects Full.json` (all ArcGIS attributes + lat/lng)
   - `data/Flood Control Projects Full.csv` (all ArcGIS attributes + lat/lng)
-- `replay_with_playwright_seed.py` (legacy): Admin‑ajax replay. Writes `data/admin_ajax_pages.json` and the same Raw JSON/CSV.
-- `capture_seed_with_playwright.py` (optional): Headful helper during capture runs.
+- Archived legacy scripts (now in `archive/`):
+  - `archive/replay_with_playwright_seed.py`: Adminajax replay. Writes `data/admin_ajax_pages.json` and the same Raw JSON/CSV.
+  - `archive/capture_seed_with_playwright.py`: Headful helper during capture runs.
+  - See `archive/README.md` for details.
 - `requirements.txt`: Minimal Python dependencies.
 - `data/`: Example outputs. The dataset is available on `data/Flood Control Projects Raw.csv`.
 

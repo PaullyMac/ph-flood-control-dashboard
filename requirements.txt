@@ -1,4 +1,5 @@
 requests>=2.31
-beautifulsoup4>=4.11
 pandas>=2.0
-playwright>=1.45
+# beautifulsoup4 and playwright are only needed for archived legacy scripts
+# beautifulsoup4>=4.11
+# playwright>=1.45
