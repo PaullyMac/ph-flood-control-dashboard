@@ -23,15 +23,42 @@ def capture_all():
         browser = p.chromium.launch(headless=False)
         ctx = browser.new_context()
         page = ctx.new_page()
-
-        page.goto("https://sumbongsapangulo.ph/", timeout=60_000)
+        # Visit homepage first (often carries window.FC config), then map page.
+        tried_urls = [
+            "https://sumbongsapangulo.ph/",
+            "https://sumbongsapangulo.ph/flood-control-map/",
+        ]
+        page.goto(tried_urls[0], timeout=60_000)
         print("Opened browser - solve captcha if present. Waiting 2s...")
         time.sleep(2)
 
         # Try to read ajax url + nonce if available via a serializable object
-        fc = page.evaluate("() => ({ajaxUrl: window.FC?.ajaxUrl, nonce: window.FC?.nonce})")
+        fc = page.evaluate("() => ({ajaxUrl: window.FC?.ajaxUrl, nonce: window.FC?.nonce})") or {}
         ajax_url = fc.get("ajaxUrl") or "https://sumbongsapangulo.ph/wp-admin/admin-ajax.php"
         nonce = fc.get("nonce") or ""
+        if not nonce:
+            # Try map page too
+            page.goto(tried_urls[1], timeout=60_000)
+            time.sleep(1.2)
+            fc2 = page.evaluate("() => ({ajaxUrl: window.FC?.ajaxUrl, nonce: window.FC?.nonce})") or {}
+            ajax_url = fc2.get("ajaxUrl") or ajax_url
+            nonce = fc2.get("nonce") or nonce
+        if not nonce:
+            # Heuristic scraping from script content
+            try:
+                html = page.content()
+            except Exception:
+                html = ""
+            m = re.search(r"nonce\s*[:=]\s*['\"]([0-9a-fA-F]+)['\"]", html)
+            if m:
+                nonce = m.group(1)
+        try:
+            meta = {"ajax_url": ajax_url, "nonce": nonce, "ts": int(time.time())}
+            Path("data").mkdir(parents=True, exist_ok=True)
+            Path("data/capture_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            print("Saved capture meta -> data/capture_meta.json", meta)
+        except Exception:
+            pass
 
         # Click "Load more" repeatedly to let the client render all cards
         clicks = 0
@@ -56,7 +83,7 @@ def capture_all():
                 except Exception:
                     break
             # Short pause for client to load additional cards
-            time.sleep(0.18)
+            time.sleep(0.28)
             # Optional: quick idle wait to settle network
             try:
                 page.wait_for_load_state("networkidle", timeout=2_000)
@@ -65,7 +92,7 @@ def capture_all():
             clicks += 1
         print("Load-more clicks:", clicks)
 
-        # Fetch admin-ajax pages via browser context (bigger per_page, shorter waits)
+    # Fetch admin-ajax pages via browser context (bigger per_page, shorter waits)
         per_page = 200
         page_no = 1
         has_more = True
@@ -136,7 +163,7 @@ def capture_all():
         time.sleep(0.12)
 
         locator = page.locator(
-            "a.load-project-card, button.load-project-card, .load-project-card, .project-card a, .project-card button"
+            "a.load-project-card, button.load-project-card, .load-project-card, .project-card a, .project-card button, table tr a[data-id]"
         )
         try:
             count = locator.count()
@@ -185,7 +212,7 @@ def capture_all():
                     modals[str(pid) if pid else str(len(modals) + 1)] = modal.inner_html()
 
                 try:
-                    close_btn = page.query_selector(".close-project-modal")
+                    close_btn = page.query_selector(".close-project-modal, #project-modal .close, .project-modal .close")
                     if close_btn:
                         close_btn.click()
                         time.sleep(0.05)

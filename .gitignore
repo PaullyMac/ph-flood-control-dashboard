@@ -20,4 +20,8 @@ Thumbs.db
 # data/*.json
 # data/*.csv
 data/playwright_cookies.json
+data/admin_ajax_pages.json
+data/capture_meta.json
+data/live_page.html
+data/project_modals.json
 

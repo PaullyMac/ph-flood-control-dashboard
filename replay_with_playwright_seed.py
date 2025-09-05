@@ -4,10 +4,15 @@ Replay the site's admin-ajax endpoint to collect project listings.
 Outputs
 - data/Flood Control Projects Raw.json
 - data/Flood Control Projects Raw.csv
+- data/admin_ajax_pages.json (debug: all raw JSON responses from admin-ajax)
 
-Notes
-- Minimal implementation: no cookies or local seed HTML.
-- TLS is verified; on SSL error, falls back to verify=False for this run.
+Improvements
+- Auto-detect ajaxUrl and nonce from the site (fallback to env NONCE if provided).
+- Paginate until server says has_more=False (no need to set MAX_PAGES for full capture).
+- Use application/x-www-form-urlencoded (simpler and more reliable than manual multipart).
+- Larger per_page by default (200) to reduce page count.
+- Optional fallback: if admin-ajax fails entirely, download the open GeoJSON dataset
+    from https://github.com/rukku/sumbongsapangulo.ph-datasets to still produce outputs.
 """
 from __future__ import annotations
 
@@ -24,15 +29,58 @@ import pandas as pd
 
 OUT_JSON = Path('data/Flood Control Projects Raw.json')
 OUT_CSV = Path('data/Flood Control Projects Raw.csv')
+OUT_AJAX_DUMP = Path('data/admin_ajax_pages.json')
 
 HEADERS = {
     'Accept': '*/*',
     'Accept-Language': 'en-US,en;q=0.9',
     'Origin': 'https://sumbongsapangulo.ph',
-    'Referer': 'https://sumbongsapangulo.ph/',
+    'Referer': 'https://sumbongsapangulo.ph/flood-control-map/',
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
     'X-Requested-With': 'XMLHttpRequest',
 }
+
+
+def _detect_nonce_and_ajax(session: requests.Session) -> tuple[str | None, str]:
+    """Try to detect window.FC.nonce and ajaxUrl from the public pages.
+    Returns (nonce, ajax_url). If nonce isn't found, returns (None, default_ajax_url).
+    """
+    default_ajax = 'https://sumbongsapangulo.ph/wp-admin/admin-ajax.php'
+    # Try flood control map page first (more likely to expose FC)
+    for url in (
+        'https://sumbongsapangulo.ph/flood-control-map/',
+        'https://sumbongsapangulo.ph/',
+    ):
+        try:
+            r = session.get(url, timeout=30)
+            r.raise_for_status()
+            html = r.text
+        except Exception:
+            continue
+
+        # Look for a serialized object like window.FC = { ajaxUrl: "...", nonce: "..." }
+        # Very forgiving regex, handles quotes and whitespace
+        m = re.search(
+            r"(?:window\.)?FC\s*=\s*\{[^}]*?ajaxUrl\s*:\s*['\"](?P<ajax>[^'\"]+)['\"][^}]*?nonce\s*:\s*['\"](?P<nonce>[^'\"]+)['\"][^}]*?\}",
+            html,
+            flags=re.I | re.S,
+        )
+        if m:
+            ajax = m.group('ajax') or default_ajax
+            nonce = m.group('nonce') or None
+            return (nonce, ajax)
+
+        # Look for a nonce attribute in markup
+        m2 = re.search(r"data-nonce=\"(?P<nonce>[0-9a-fA-F]+)\"", html)
+        if m2:
+            return (m2.group('nonce'), default_ajax)
+
+        # As a last resort, sometimes localized scripts print "nonce":"..."
+        m3 = re.search(r"\bnonce\b\s*[:=]\s*['\"](?P<nonce>[0-9a-fA-F]+)['\"]", html)
+        if m3:
+            return (m3.group('nonce'), default_ajax)
+
+    return (None, default_ajax)
 
 
 def _infer_project_type_from_text(text: str) -> str | None:
@@ -273,19 +321,54 @@ def parse_rows_html_to_dicts(rows_html: str, seed_soup: BeautifulSoup | None = N
 
 
 def main() -> int:
-    ajax_url = 'https://sumbongsapangulo.ph/wp-admin/admin-ajax.php'
-    nonce = os.environ.get('NONCE') or '657d8c0d88'
-
-    per_page = int(os.environ.get('PER_PAGE', '20'))
-    max_pages = int(os.environ.get('MAX_PAGES', '1'))
-
     session = requests.Session()
     session.headers.update(HEADERS)
     session.verify = True
     used_insecure = False
 
-    boundary = '----WebKitFormBoundaryf4mNfpSZdKzhRhvN'
-    content_type = f'multipart/form-data; boundary={boundary}'
+    # If Playwright cookies exist, load them into the session (helps if site expects cookies)
+    cookie_path = Path('data/playwright_cookies.json')
+    if cookie_path.exists():
+        try:
+            cookies = json.loads(cookie_path.read_text(encoding='utf-8'))
+            for c in cookies:
+                name = c.get('name'); value = c.get('value')
+                if not name:
+                    continue
+                domain = c.get('domain') or 'sumbongsapangulo.ph'
+                path = c.get('path') or '/'
+                session.cookies.set(name, value, domain=domain, path=path)
+            print('Loaded cookies from', cookie_path)
+        except Exception as e:
+            print('Could not load cookies:', e)
+
+    # Allow override via env, else auto-detect
+    env_nonce = os.environ.get('NONCE')
+    nonce: str | None = None
+    ajax_url: str = 'https://sumbongsapangulo.ph/wp-admin/admin-ajax.php'
+    # Highest priority: capture_meta.json produced by headful capture
+    meta_path = Path('data/capture_meta.json')
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding='utf-8'))
+            ajax_url = meta.get('ajax_url') or ajax_url
+            nonce = meta.get('nonce') or None
+            print('Using capture_meta nonce/ajax_url from', meta_path)
+        except Exception:
+            pass
+    if env_nonce:
+        nonce = env_nonce
+        ajax_url = os.environ.get('AJAX_URL', ajax_url)
+        print('Using NONCE from environment and ajax_url', ajax_url)
+    if nonce is None:
+        n2, a2 = _detect_nonce_and_ajax(session)
+        nonce = n2
+        ajax_url = a2 or ajax_url
+        print('Detected ajax endpoint:', ajax_url, '| nonce:', (nonce or '(none)'))
+
+    # Paging controls
+    per_page = int(os.environ.get('PER_PAGE', '200'))  # higher throughput
+    max_pages = int(os.environ.get('MAX_PAGES', '1000'))  # safety cap only
 
     # Load local seed HTML for enrichment automatically if present.
     # To disable automatic loading set environment USE_SEED=0
@@ -301,7 +384,7 @@ def main() -> int:
         print('Found seed HTML at data/live_page.html but automatic loading is disabled via USE_SEED=0')
 
     all_rows: list[dict] = []
-    seen: set = set()
+    seen: set[str] = set()
     # Load captured modal HTML map if available
     modal_map = {}
     modal_path = Path('data/project_modals.json')
@@ -312,26 +395,23 @@ def main() -> int:
         except Exception as e:
             print('Could not read project_modals.json:', e)
     page = 1
+    ajax_dump: list[dict] = []
 
     while page <= max_pages:
-        parts = [
-            f'--{boundary}\r\nContent-Disposition: form-data; name="action"\r\n\r\nfilter_projects\r\n',
-            f'--{boundary}\r\nContent-Disposition: form-data; name="nonce"\r\n\r\n{nonce}\r\n',
-            f'--{boundary}\r\nContent-Disposition: form-data; name="page"\r\n\r\n{page}\r\n',
-            f'--{boundary}\r\nContent-Disposition: form-data; name="per_page"\r\n\r\n{per_page}\r\n',
-            f'--{boundary}\r\nContent-Disposition: form-data; name="region"\r\n\r\n\r\n',
-            f'--{boundary}\r\nContent-Disposition: form-data; name="year"\r\n\r\n\r\n',
-            f'--{boundary}\r\nContent-Disposition: form-data; name="type_of_work"\r\n\r\n\r\n',
-            f'--{boundary}\r\nContent-Disposition: form-data; name="municipality"\r\n\r\n\r\n',
-            f'--{boundary}\r\nContent-Disposition: form-data; name="search_itm"\r\n\r\n\r\n',
-            f'--{boundary}--\r\n',
-        ]
-        body = ''.join(parts).encode('utf-8')
-        headers = dict(session.headers)
-        headers['Content-Type'] = content_type
-
+        # application/x-www-form-urlencoded payload
+        form = {
+            'action': 'filter_projects',
+            'nonce': nonce or '',  # some servers accept empty/omitted nonce
+            'page': str(page),
+            'per_page': str(per_page),
+            'region': '',
+            'year': '',
+            'type_of_work': '',
+            'municipality': '',
+            'search_itm': '',
+        }
         try:
-            r = session.post(ajax_url, data=body, headers=headers, timeout=30)
+            r = session.post(ajax_url, data=form, timeout=60)
             r.raise_for_status()
             try:
                 j = r.json()
@@ -358,14 +438,22 @@ def main() -> int:
         rows_html = data.get('rows') or ''
         has_more = bool(data.get('has_more'))
 
-        parsed = parse_rows_html_to_dicts(rows_html, seed_soup=seed_soup)
+        # Keep a raw dump (without the heavy HTML if you want, but store as-is for traceability)
+        try:
+            ajax_dump.append(j)
+        except Exception:
+            pass
+
+        parsed = parse_rows_html_to_dicts(rows_html, seed_soup=seed_soup, modal_map=modal_map or None)
         new = 0
         for row in parsed:
-            pid = row.get('project_id') or row.get('report_contract_id')
-            if pid and pid in seen:
+            pid = row.get('project_id')
+            rcid = row.get('report_contract_id')
+            # Composite key avoids collapsing distinct items that share a contract id
+            key = f"pid:{pid}|rcid:{rcid}"
+            if key in seen:
                 continue
-            if pid:
-                seen.add(pid)
+            seen.add(key)
             all_rows.append(row)
             new += 1
         print(f'Page {page}: parsed {len(parsed)} rows, new {new}, has_more={has_more}')
@@ -376,7 +464,53 @@ def main() -> int:
         page += 1
         if not has_more:
             break
-        time.sleep(0.5)
+        time.sleep(0.2)
+
+    # If nothing came back and fallback is allowed, try open dataset GeoJSON
+    if not all_rows and os.environ.get('FALLBACK_GEOJSON', '1') == '1':
+        try:
+            url = 'https://raw.githubusercontent.com/rukku/sumbongsapangulo.ph-datasets/main/flood_control_projects.geojson'
+            print('Admin-ajax returned no data. Attempting GeoJSON fallback from:', url)
+            g = session.get(url, timeout=60)
+            g.raise_for_status()
+            gj = g.json()
+            feats = gj.get('features') or []
+            for f in feats:
+                props = f.get('properties') or {}
+                row = {
+                    'project_id': props.get('ContractID') or props.get('GlobalID') or None,
+                    'description': props.get('ProjectDescription') or None,
+                    'location': (props.get('Municipality') or '') + ((', ' + props.get('Province')) if props.get('Province') else ''),
+                    'contractor': props.get('Contractor') or None,
+                    'cost': props.get('ContractCost') or None,
+                    'completion_date': props.get('CompletionDate') or None,
+                    'report_contract_id': props.get('ContractID') or None,
+                    'start_date': props.get('StartDate') or None,
+                    'project_type': props.get('TypeofWork') or None,
+                    'funding_year': props.get('InfraYear') or None,
+                    'report_year': props.get('InfraYear') or None,
+                    'region': props.get('Region') or None,
+                    'lat': None,
+                    'lng': None,
+                }
+                geom = f.get('geometry') or {}
+                coords = (geom.get('coordinates') or [None, None])
+                if isinstance(coords, (list, tuple)) and len(coords) >= 2:
+                    row['lng'] = coords[0]
+                    row['lat'] = coords[1]
+                all_rows.append(row)
+            print('Loaded from GeoJSON fallback:', len(all_rows), 'rows')
+        except Exception as e:
+            print('GeoJSON fallback failed:', e)
+
+    # Dump raw ajax pages for inspection
+    try:
+        OUT_AJAX_DUMP.parent.mkdir(parents=True, exist_ok=True)
+        OUT_AJAX_DUMP.write_text(json.dumps(ajax_dump, ensure_ascii=False, indent=2), encoding='utf-8')
+        if ajax_dump:
+            print('Saved raw admin-ajax pages ->', OUT_AJAX_DUMP)
+    except Exception:
+        pass
 
     # --- START: NORMALIZATION FOR REQUIRED JSON NULLS ---
     REQUIRED_NULL_KEYS = [ "start_date", "project_type", "funding_year", "report_year", "region", "lat", "lng", ]
@@ -504,6 +638,7 @@ def main() -> int:
     with open(OUT_JSON, 'w', encoding='utf-8') as f:
         json.dump(all_rows, f, ensure_ascii=False, indent=2)
     print('Saved JSON ->', OUT_JSON)
+    print(f'Total rows collected: {len(all_rows)} | Unique keys: {len(seen)}')
     if all_rows:
         df = pd.json_normalize(all_rows)
         df.to_csv(OUT_CSV, index=False)
