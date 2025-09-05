@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+
+# Envs
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local data/output that you do not want to commit by default
+# (Keep explicit tracked data files by adding them before .gitignore or using ! exceptions.)
+# data/*.json
+# data/*.csv
+data/playwright_cookies.json
+
